@@ -1,74 +1,182 @@
 ---
 name: custom-codereview-guide
-description: Repo-specific code review guidelines for All-Hands-AI/OpenHands. Provides frontend and backend review rules in addition to the default code review skill.
+description: Repository-specific review rules for the OpenHands Agent Canvas frontend.
 triggers:
-- /codereview
+  - /codereview
 ---
 
-# All-Hands-AI/OpenHands Code Review Guidelines
+# OpenHands Agent Canvas Code Review Guidelines
 
-You are an expert code reviewer for the **All-Hands-AI/OpenHands** repository. This skill provides repo-specific review guidelines.
+This guide supplements the public `code-review` skill with rules specific to
+`OpenHands/OpenHands`, the Agent Canvas frontend. Read `AGENTS.md` first; it is
+the detailed source of truth for current architecture and test conventions.
 
-## Automated PR Triage Before Review
+Be direct and constructive. Review correctness and architecture, not formatting
+that lint or the compiler already checks.
 
-Before performing a code review on a PR submitted for review, check that the PR follows `.github/pull_request_template.md` with the expected sections present and filled out (note: "N/A" or "Not applicable" is acceptable when a section genuinely doesn't apply), especially:
+## Review Decision
 
-- `Why`
-- `Summary`
-- `Issue Number` when relevant
-- `How to Test`
-- `Video/Screenshots` when the change affects UI or behavior that benefits from visual proof
-- `Type`
+- Submit exactly one review: **APPROVE** or **COMMENT**. Never use
+  **REQUEST_CHANGES**.
+- Default to **APPROVE** when there are no important findings. Nitpicks and
+  optional cleanup are not reasons to withhold approval.
+- Use **COMMENT** for correctness, security, architecture, missing evidence, or
+  unmet acceptance criteria. Let a human maintainer make the blocking decision.
+- Do not approve changes that can affect agent or benchmark behavior—prompts,
+  tool selection, conversation payloads, terminal behavior, planning, memory,
+  or evaluation paths—without human review and appropriate lightweight evals.
+- Read the linked issue and include a compact checklist covering each acceptance
+  criterion. Meeting the checklist is necessary but does not replace review for
+  regressions, security, or maintainability.
 
-If the PR does not follow the template, try to mark it back to draft (preferred) or close it, depending on the bot's available permissions. If neither action is available, leave a comment explaining the issue. For example:
+## Repository Ownership
 
-> This PR does not follow our suggested PR template. Once your PR matches the template, you're welcome to re-submit it for review.
+Put behavior in the repository that owns it:
 
-Only perform the normal automated first-pass review after the PR passes template compliance.
+| Repository                     | Owns                                                                                                            |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `OpenHands/OpenHands`          | Agent Canvas UI, frontend state, backend selection, frontend service integration, and local-stack orchestration |
+| `OpenHands/software-agent-sdk` | Agent Server, agents, tools, conversations, events, workspaces, and the canonical server API                    |
+| `OpenHands/typescript-client`  | Browser-compatible typed access to the Agent Server API                                                         |
+| `OpenHands/extensions`         | Reusable skills, plugins, and integrations                                                                      |
+| `OpenHands/automation`         | Scheduling, webhooks, run history, and automation dispatch                                                      |
 
-## Frontend: i18n / Translation Key Usage
+The normal dependency direction is Agent Server contract → TypeScript client →
+Canvas. Flag raw endpoint reimplementations, Canvas-local copies of server
+contracts, and changes opened in the wrong repository.
 
-**Never dynamically construct i18n keys via string interpolation or template literals.**
+## Architecture That Guides Agents
 
-All translation keys must come from the `I18nKey` enum (`frontend/src/i18n/declaration.ts`) or from canonical mapping objects like `AGENT_STATUS_MAP` (`frontend/src/utils/status.ts`). Dynamically constructed keys (e.g., `` t(`STATUS$${value.toUpperCase()}`) ``) will silently fall back to the raw key string at runtime because `i18next` returns the key itself when a translation is missing — this produces broken UI text with no build-time or test-time error.
+Agents tend to copy the nearest pattern and choose the shortest compiling path.
+Review the codebase as part of the product surface that guides those choices:
 
-### What to flag
+1. **Make the conventional path cheapest.** New work should naturally reuse a
+   named hook, service, store, or feature module instead of adding another branch
+   to a shared root.
+2. **Fail forbidden dependencies mechanically.** Repeated review guidance should
+   become a lint rule, compiler boundary, or architecture test. Do not grow this
+   document when a small executable guard would be clearer.
+3. **Give durable state one obvious writer.** A backend setting, consent value,
+   conversation cache entry, or persisted browser value should have one named
+   owner. Flag second writers and component-local mirrors of authoritative state.
+4. **Prefer owned feature files over shared switches.** Product work should
+   usually extend a feature-owned module. Shared registries and root conditionals
+   need a concrete reason.
+5. **Keep exceptions narrow and visible.** Exceptions belong in a small allowlist
+   next to the guard that enforces the rule and should be reviewed as architecture
+   changes.
 
-- Any call to `t(...)` or `i18next.t(...)` where the key is built at runtime via template literals, string concatenation, or helper functions rather than referencing `I18nKey` or a known mapping
-- Any new i18n key referenced in code that does not exist in `frontend/src/i18n/translation.json`
+Treat “deep module” as a design heuristic, not a line-count target. A good module
+has a narrow, stable interface and hides cohesive complexity. Do not split a file
+merely because it is long, and do not create layers that only rename or forward
+arguments. Prefer a small pure seam when it removes duplicated decisions, makes
+ownership explicit, or enables focused tests.
 
-### Correct pattern
+### React effects
 
-```ts
-import { AGENT_STATUS_MAP } from "#/utils/status";
+`useEffect` is for synchronizing React with an external system. Flag effects used
+to:
 
-const i18nKey = AGENT_STATUS_MAP[agentState];
-const message = i18nKey ? t(i18nKey) : fallback;
-```
+- derive render data from props or state;
+- respond to a user action that can run in the event handler;
+- initialize a value that belongs in a lazy state initializer;
+- mirror one store or cache into another component state value; or
+- repair ordering created by competing writers.
 
-### Incorrect pattern
+An effect is not automatically wrong. Subscription, browser API, timer, and
+network synchronization still belong in effects when cleanup and dependency
+semantics are explicit.
 
-```ts
-// BAD: constructs a key that may not exist in translation.json
-const message = t(`STATUS$${agentState.toUpperCase()}`);
-```
+## Blocking Architecture Checkpoints
 
-## Frontend: Data Fetching Architecture
+### Agent Server and Cloud API access
 
-UI components must never call API client methods (`frontend/src/api/`) directly. All data access must go through TanStack Query hooks:
+`src/api/no-direct-agent-server-calls.test.ts` is the executable source of truth.
+Do not approve new raw `fetch`, `axios`, shared `openHands`, or low-level HTTP
+client access to Agent Server endpoints. Use `@openhands/typescript-client` with
+the options from `src/api/agent-server-client-options.ts`.
 
-```
-UI components → TanStack Query hooks (frontend/src/hooks/query/ or mutation/) → API client (frontend/src/api/) → API endpoints
-```
+Cloud and runtime-sandbox requests must go through `callCloudProxy`; runtime
+requests must provide the correct `hostOverride` and authentication mode. Review
+changes to the guard's allowlist as architecture changes. Do not copy its current
+entries into this guide—the test should remain the one authoritative list.
 
-Flag any component that imports directly from `#/api/` and calls fetch/mutation functions without a TanStack Query wrapper.
+### Event wire contracts
 
-## Review Verdict: Submit the Review State That Matches Your Verdict
+The SDK event model is the wire authority, the TypeScript client mirrors it, and
+Canvas consumes the published client type. Do not approve Canvas-local
+redeclarations, partial intersections, module augmentation, or presentation
+fields added to wire-event interfaces.
 
-GitHub does not clear a prior `CHANGES_REQUESTED` from a reviewer when that reviewer later leaves a `COMMENT` — only an `APPROVE` supersedes it. So always submit the review with the state that matches your actual verdict, or PRs get stuck blocked by a stale decision:
+A contract change should land in this order:
 
-- **APPROVE** when the PR meets the merge bar — no critical or blocking issues remain (only optional/non-blocking suggestions). If you previously requested changes and those blocking issues are now resolved, submit an **APPROVE** (you may still list remaining non-blocking suggestions in the body) so your earlier `CHANGES_REQUESTED` is cleared.
-- **REQUEST_CHANGES** only when there are genuine blocking issues that must be fixed before merge.
-- **COMMENT** only for a purely informational pass where you are neither approving nor blocking.
+1. SDK model/schema and serialization coverage.
+2. TypeScript-client mirror derived from the SDK payload.
+3. Published client release.
+4. Canvas consumption and rendering/telemetry coverage.
 
-Do not leave a PR in `CHANGES_REQUESTED` once its blocking issues are resolved and your verdict is effectively "worth merging" — approve it.
+Canvas-only presentation state belongs in a separate view model keyed by event
+identity.
+
+### Telemetry and durable frontend state
+
+- `src/services/telemetry.ts` is the only owner of the Canvas PostHog client.
+- React events go through typed functions in `src/hooks/use-tracking.ts`; components
+  must not call PostHog directly.
+- Consent rendering uses the telemetry consent external store, not mirrored local
+  state. `setTelemetryConsent` remains the single consent controller.
+- A business milestone has one canonical capture. Flag duplicate conditional
+  captures.
+- For other durable values, prefer the existing named service/store/hook and flag
+  new storage writes from arbitrary components.
+
+## Dependencies and Releases
+
+- Direct dependencies are exact-pinned. Keep `package.json` and
+  `package-lock.json` synchronized through npm; do not hand-edit one side only.
+- Treat changes to dependency exemptions, git pins, and security overrides as
+  reviewable policy changes. `__tests__/package-library.test.ts` is the executable
+  source of truth for allowed specs.
+- Scrutinize newly published third-party dependency versions for supply-chain
+  risk. First-party OpenHands packages are exempt from a waiting period but not
+  from contract and release-order review.
+- Package version changes belong in explicit release PRs and must match the
+  release workflow expectations.
+
+## Testing and Evidence
+
+- Require evidence proportional to the behavior changed. For UI behavior, use a
+  screenshot or video from the real app. For CLI, API, or scripts, require the
+  exact runtime command and observed result. Unit tests alone are not end-to-end
+  evidence.
+- Prefer tests that exercise real logic and observable state. Do not reward mocks
+  that only prove another mock was called.
+- Keep tests focused: one meaningful assertion path per behavior, no duplicated
+  coverage of library behavior, and no brittle presentation-only snapshots.
+- Follow the test routing in `AGENTS.md`. If a change crosses a full-stack flow
+  and lacks suitable coverage, recommend mock-LLM E2E and add the `e2e-tests`
+  label when appropriate.
+- Never broaden live E2E triggers or secret exposure for convenience.
+
+## What Not to Comment On
+
+Do not leave review comments for:
+
+- formatting or minor style that tooling handles;
+- optional “nice to have” refactors unrelated to the change;
+- praise-only observations—approve instead;
+- extra tests for straightforward data/config changes when existing checks cover
+  the risk; or
+- temporary `.pr/` artifacts, which are cleaned up by repository automation.
+
+When raising a finding, trace the relevant call or data flow far enough to show
+the concrete failure mode. Prefer one high-signal comment over several symptoms
+of the same ownership problem.
+
+## Communication Style
+
+- Be concise, specific, and friendly.
+- Explain the user-visible or architectural consequence.
+- Suggest the smallest viable correction.
+- Use GitHub suggestion syntax for local fixes.
+- If the PR is sound, approve it without manufacturing feedback.
